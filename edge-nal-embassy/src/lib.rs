@@ -3,13 +3,17 @@
 #![warn(clippy::large_futures)]
 #![allow(clippy::uninlined_format_args)]
 #![allow(unknown_lints)]
+// The buffer pool is for TCP sockets, which are not ported to xarxa yet.
+#![cfg_attr(not(feature = "tcp"), allow(dead_code))]
 
 use core::cell::{Cell, UnsafeCell};
 use core::mem::MaybeUninit;
 use core::net::{IpAddr, SocketAddr};
 use core::ptr::NonNull;
 
-use embassy_net::{IpAddress, IpEndpoint, IpListenEndpoint};
+use embassy_net::wire::{
+    IpAddr as IpAddress, ListenSocketAddr as IpListenEndpoint, SocketAddr as IpEndpoint,
+};
 
 #[cfg(feature = "dns")]
 pub use dns::*;
@@ -26,14 +30,17 @@ pub(crate) mod fmt;
 #[cfg(feature = "dns")]
 mod dns;
 #[cfg(feature = "tcp")]
+compile_error!("edge-nal-embassy's `tcp` is not ported to embassy-net on xarxa yet");
+#[cfg(feature = "tcp")]
 mod tcp;
 #[cfg(feature = "udp")]
 mod udp;
 
 /// A const-generics-erased trait variant of `Pool`
 ///
-/// Allows for types like `Tcp`, `TcpSocket`, `Udp` and `UdpSocket` that do reference the
-/// pool to erase the const-generics set on the Pool object type when used for TCP and UDP buffers.
+/// Allows for types like `Tcp` and `TcpSocket` that do reference the pool to erase the
+/// const-generics set on the Pool object type when used for TCP buffers (UDP sockets on xarxa
+/// hold no buffers of their own).
 ///
 /// To erase the type of the pool itself, these types use `&dyn DynPool<B>`
 pub trait DynPool<B>: SealedDynPool<B> {}
@@ -172,19 +179,10 @@ pub(crate) fn to_emb_addr(addr: IpAddr) -> Option<IpAddress> {
 
 #[cfg(test)]
 pub(crate) mod test {
-    extern crate std;
-
-    #[cfg(feature = "medium-ethernet")]
-    use core::cell::RefCell;
-    use core::task::Context;
-
-    #[cfg(feature = "medium-ethernet")]
-    use std::{collections::VecDeque, rc::Rc, vec, vec::Vec};
-
-    use embassy_net::driver::{Capabilities, Driver, HardwareAddress, LinkState, RxToken, TxToken};
-    use embassy_net::{
-        Config, Ipv4Address, Ipv4Cidr, Runner, Stack, StackResources, StaticConfigV4,
+    use embassy_net::driver::{
+        Capabilities, Driver, HardwareAddress, LinkState, NotSupported, PacketBuf,
     };
+    use embassy_net::{Runner, Stack, StackStorage, StaticPool};
 
     use super::Pool;
 
@@ -212,46 +210,14 @@ pub(crate) mod test {
     /// A network driver that never sends or receives anything.
     ///
     /// Used to construct a `Stack` for the socket tests, which only exercise
-    /// the socket buffers management and never actually communicate.
+    /// socket creation and never actually communicate.
+    ///
+    /// The in-memory link between two stacks that the TCP tests use (`pipe`, `stack_on`)
+    /// is left out until `tcp` is ported: it is written for the `Driver` of embassy-net
+    /// on smoltcp.
     pub(crate) struct DummyDriver;
 
-    /// A token type that is never constructed, as `DummyDriver` never produces any tokens.
-    pub(crate) enum Never {}
-
-    impl RxToken for Never {
-        fn consume<R, F>(self, _f: F) -> R
-        where
-            F: FnOnce(&mut [u8]) -> R,
-        {
-            match self {}
-        }
-    }
-
-    impl TxToken for Never {
-        fn consume<R, F>(self, _len: usize, _f: F) -> R
-        where
-            F: FnOnce(&mut [u8]) -> R,
-        {
-            match self {}
-        }
-    }
-
     impl Driver for DummyDriver {
-        type RxToken<'a> = Never;
-        type TxToken<'a> = Never;
-
-        fn receive(&mut self, _cx: &mut Context) -> Option<(Never, Never)> {
-            None
-        }
-
-        fn transmit(&mut self, _cx: &mut Context) -> Option<Never> {
-            None
-        }
-
-        fn link_state(&mut self, _cx: &mut Context) -> LinkState {
-            LinkState::Down
-        }
-
         fn capabilities(&self) -> Capabilities {
             let mut caps = Capabilities::default();
             caps.max_transmission_unit = 1514;
@@ -262,128 +228,55 @@ pub(crate) mod test {
         fn hardware_address(&self) -> HardwareAddress {
             HardwareAddress::Ethernet([2, 0, 0, 0, 0, 1])
         }
-    }
 
-    /// One end of an in-memory Ethernet link between two stacks: what one end sends, the
-    /// other receives.
-    ///
-    /// Used by the tests that need two stacks to actually communicate. Nothing is woken
-    /// when a packet arrives, so the stacks' runners must be busy-polled, as
-    /// `embassy_futures::block_on` does.
-    #[cfg(feature = "medium-ethernet")]
-    pub(crate) struct PipeDriver {
-        mac: [u8; 6],
-        tx: Rc<RefCell<VecDeque<Vec<u8>>>>,
-        rx: Rc<RefCell<VecDeque<Vec<u8>>>>,
-    }
+        fn link_state(&mut self) -> LinkState {
+            LinkState::Down
+        }
 
-    /// A packet that a `PipeDriver` received.
-    #[cfg(feature = "medium-ethernet")]
-    pub(crate) struct PipeRx(Vec<u8>);
+        fn register_waker(&mut self, _waker: &core::task::Waker) -> Result<(), NotSupported> {
+            Ok(())
+        }
 
-    /// A packet that a `PipeDriver` sends to the other end.
-    #[cfg(feature = "medium-ethernet")]
-    pub(crate) struct PipeTx<'a>(&'a RefCell<VecDeque<Vec<u8>>>);
+        fn rx_wanted(&mut self) -> usize {
+            0
+        }
 
-    #[cfg(feature = "medium-ethernet")]
-    impl RxToken for PipeRx {
-        fn consume<R, F>(mut self, f: F) -> R
-        where
-            F: FnOnce(&mut [u8]) -> R,
-        {
-            f(&mut self.0)
+        fn rx_give(&mut self, _buf: PacketBuf) {}
+
+        fn receive(&mut self) -> Option<PacketBuf> {
+            None
+        }
+
+        fn can_transmit(&mut self) -> bool {
+            false
+        }
+
+        fn transmit(&mut self, buf: PacketBuf) -> Result<(), PacketBuf> {
+            Err(buf)
         }
     }
 
-    #[cfg(feature = "medium-ethernet")]
-    impl TxToken for PipeTx<'_> {
-        fn consume<R, F>(self, len: usize, f: F) -> R
-        where
-            F: FnOnce(&mut [u8]) -> R,
-        {
-            let mut packet = vec![0; len];
-            let result = f(&mut packet);
+    /// A stack with one interface, the dummy driver, at 10.0.0.1/24. Leaked:
+    /// the stack wants its storage, pool and driver for its whole life.
+    pub(crate) fn stack() -> (Stack<'static>, Runner<'static>) {
+        extern crate std;
+        use std::boxed::Box;
 
-            self.0.borrow_mut().push_back(packet);
-
-            result
-        }
-    }
-
-    #[cfg(feature = "medium-ethernet")]
-    impl Driver for PipeDriver {
-        type RxToken<'a> = PipeRx;
-        type TxToken<'a> = PipeTx<'a>;
-
-        fn receive(&mut self, _cx: &mut Context) -> Option<(PipeRx, PipeTx<'_>)> {
-            let packet = self.rx.borrow_mut().pop_front()?;
-
-            Some((PipeRx(packet), PipeTx(&self.tx)))
-        }
-
-        fn transmit(&mut self, _cx: &mut Context) -> Option<PipeTx<'_>> {
-            Some(PipeTx(&self.tx))
-        }
-
-        fn link_state(&mut self, _cx: &mut Context) -> LinkState {
-            LinkState::Up
-        }
-
-        fn capabilities(&self) -> Capabilities {
-            let mut caps = Capabilities::default();
-            caps.max_transmission_unit = 1514;
-
-            caps
-        }
-
-        fn hardware_address(&self) -> HardwareAddress {
-            HardwareAddress::Ethernet(self.mac)
-        }
-    }
-
-    /// The two ends of an in-memory Ethernet link.
-    #[cfg(feature = "medium-ethernet")]
-    pub(crate) fn pipe() -> (PipeDriver, PipeDriver) {
-        let a = Rc::new(RefCell::new(VecDeque::new()));
-        let b = Rc::new(RefCell::new(VecDeque::new()));
-
-        (
-            PipeDriver {
-                mac: [2, 0, 0, 0, 0, 1],
-                tx: a.clone(),
-                rx: b.clone(),
-            },
-            PipeDriver {
-                mac: [2, 0, 0, 0, 0, 2],
-                tx: b,
-                rx: a,
-            },
-        )
-    }
-
-    /// Create a `Stack` backed by `DummyDriver`, for the socket tests.
-    pub(crate) fn stack<const SOCK: usize>(
-        resources: &mut StackResources<SOCK>,
-    ) -> (Stack<'_>, Runner<'_, DummyDriver>) {
-        stack_on(DummyDriver, 1, resources)
-    }
-
-    /// Create a `Stack` backed by `driver`, with the address 10.0.0.`host`/24.
-    pub(crate) fn stack_on<D: Driver, const SOCK: usize>(
-        driver: D,
-        host: u8,
-        resources: &mut StackResources<SOCK>,
-    ) -> (Stack<'_>, Runner<'_, D>) {
-        embassy_net::new(
-            driver,
-            Config::ipv4_static(StaticConfigV4 {
-                address: Ipv4Cidr::new(Ipv4Address::new(10, 0, 0, host), 24),
-                gateway: None,
-                dns_servers: Default::default(),
-            }),
-            resources,
-            0,
-        )
+        let storage = Box::leak(Box::new(StackStorage::new()));
+        let pool: &'static StaticPool<1514, 4> = Box::leak(Box::new(StaticPool::new()));
+        let (stack, runner) = Stack::new(storage, pool, 0);
+        let iface = stack
+            .add_iface_borrowed(Box::leak(Box::new(DummyDriver)))
+            .unwrap();
+        #[cfg(feature = "proto-ipv4")]
+        iface
+            .add_ip_addr(embassy_net::wire::IpCidr::new(
+                core::net::Ipv4Addr::new(10, 0, 0, 1).into(),
+                24,
+            ))
+            .unwrap();
+        let _ = iface;
+        (stack, runner)
     }
 
     #[test]

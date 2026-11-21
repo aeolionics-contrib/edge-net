@@ -2,7 +2,7 @@
 name = "edge-nal-embassy"
 version = "0.9.0"
 edition = "2021"
-rust-version = "1.91"
+rust-version = "1.100"
 description = "An implementation of edge-nal based on `embassy-net`"
 repository = "https://github.com/sysgrok/edge-net"
 readme = "README.md"
@@ -16,19 +16,21 @@ categories = [
 
 [features]
 default = ["all"]
-all = ["proto-ipv4", "proto-ipv6", "medium-ethernet", "medium-ip", "dns", "udp", "tcp", "multicast", "icmp", "dhcpv4", "dhcpv4-hostname"]
+# `tcp` is left out until it is ported to embassy-net on xarxa.
+all = ["proto-ipv4", "proto-ipv6", "medium-ethernet", "medium-ip", "dns", "udp", "multicast", "dhcpv4", "dhcpv4-hostname"]
 defmt = ["dep:defmt", "embassy-net/defmt"]
-proto-ipv4 = ["embassy-net/proto-ipv4"]
-proto-ipv6 = ["embassy-net/proto-ipv6"]
+proto-ipv4 = ["embassy-net/ipv4"]
+proto-ipv6 = ["embassy-net/ipv6"]
 medium-ethernet = ["embassy-net/medium-ethernet"]
 medium-ip = ["embassy-net/medium-ip"]
 dns = ["embassy-net/dns"]
 udp = ["embassy-net/udp"]
-tcp = ["embassy-net/tcp"]
-icmp = ["embassy-net/icmp"]
+tcp = ["embassy-net/tcp", "dep:embassy-futures", "dep:embassy-time"]
+# embassy-net on xarxa has no ICMP sockets; kept for compatibility.
+icmp = []
 multicast = ["embassy-net/multicast"]
 dhcpv4 = ["embassy-net/dhcpv4"]
-dhcpv4-hostname = ["embassy-net/dhcpv4-hostname"]
+dhcpv4-hostname = ["dhcpv4", "embassy-net/hostname"]
 slaac = ["proto-ipv6", "embassy-net/slaac"]
 
 [dependencies]
@@ -37,8 +39,8 @@ defmt = { workspace = true, default-features = false, optional = true }
 embedded-io-async = { workspace = true }
 edge-nal = { workspace = true }
 embassy-net = { workspace = true }
-embassy-futures = { workspace = true }
-embassy-time = { workspace = true }
+embassy-futures = { workspace = true, optional = true }
+embassy-time = { workspace = true, optional = true }
 
 [dev-dependencies]
 # The socket tests construct an `embassy-net` stack, which needs a time driver

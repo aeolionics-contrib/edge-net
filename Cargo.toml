@@ -154,3 +154,12 @@ edge-nal-std = { version = "0.7", path = "edge-nal-std", default-features = fals
 edge-nal-embassy = { version = "0.9", path = "edge-nal-embassy", default-features = false }
 edge-nal-tls = { version = "0.4", path = "edge-nal-tls", default-features = false }
 edge-nal-openthread = { version = "0.4", path = "edge-nal-openthread", default-features = false }
+
+# embassy-net on embassy main, on xarxa: every embassy crate at one revision.
+[patch.crates-io]
+embassy-futures = { git = "https://github.com/embassy-rs/embassy", rev = "1c5f29e0256d1853daeb1de866d53489614d3a6f" }
+embassy-net = { git = "https://github.com/embassy-rs/embassy", rev = "1c5f29e0256d1853daeb1de866d53489614d3a6f" }
+embassy-sync = { git = "https://github.com/embassy-rs/embassy", rev = "1c5f29e0256d1853daeb1de866d53489614d3a6f" }
+embassy-time = { git = "https://github.com/embassy-rs/embassy", rev = "1c5f29e0256d1853daeb1de866d53489614d3a6f" }
+embassy-time-driver = { git = "https://github.com/embassy-rs/embassy", rev = "1c5f29e0256d1853daeb1de866d53489614d3a6f" }
+embassy-time-queue-utils = { git = "https://github.com/embassy-rs/embassy", rev = "1c5f29e0256d1853daeb1de866d53489614d3a6f" }
