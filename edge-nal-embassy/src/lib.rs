@@ -3,13 +3,17 @@
 #![warn(clippy::large_futures)]
 #![allow(clippy::uninlined_format_args)]
 #![allow(unknown_lints)]
+// The buffer pool is for TCP sockets, which are not ported to xarxa yet.
+#![cfg_attr(not(feature = "tcp"), allow(dead_code))]
 
 use core::cell::{Cell, UnsafeCell};
 use core::mem::MaybeUninit;
 use core::net::{IpAddr, SocketAddr};
 use core::ptr::NonNull;
 
-use embassy_net::{IpAddress, IpEndpoint, IpListenEndpoint};
+use embassy_net::wire::{
+    IpAddr as IpAddress, ListenSocketAddr as IpListenEndpoint, SocketAddr as IpEndpoint,
+};
 
 #[cfg(feature = "dns")]
 pub use dns::*;
@@ -26,14 +30,17 @@ pub(crate) mod fmt;
 #[cfg(feature = "dns")]
 mod dns;
 #[cfg(feature = "tcp")]
+compile_error!("edge-nal-embassy's `tcp` is not ported to embassy-net on xarxa yet");
+#[cfg(feature = "tcp")]
 mod tcp;
 #[cfg(feature = "udp")]
 mod udp;
 
 /// A const-generics-erased trait variant of `Pool`
 ///
-/// Allows for types like `Tcp`, `TcpSocket`, `Udp` and `UdpSocket` that do reference the
-/// pool to erase the const-generics set on the Pool object type when used for TCP and UDP buffers.
+/// Allows for types like `Tcp` and `TcpSocket` that do reference the pool to erase the
+/// const-generics set on the Pool object type when used for TCP buffers (UDP sockets on xarxa
+/// hold no buffers of their own).
 ///
 /// To erase the type of the pool itself, these types use `&dyn DynPool<B>`
 pub trait DynPool<B>: SealedDynPool<B> {}
@@ -172,12 +179,10 @@ pub(crate) fn to_emb_addr(addr: IpAddr) -> Option<IpAddress> {
 
 #[cfg(test)]
 pub(crate) mod test {
-    use core::task::Context;
-
-    use embassy_net::driver::{Capabilities, Driver, HardwareAddress, LinkState, RxToken, TxToken};
-    use embassy_net::{
-        Config, Ipv4Address, Ipv4Cidr, Runner, Stack, StackResources, StaticConfigV4,
+    use embassy_net::driver::{
+        Capabilities, Driver, HardwareAddress, LinkState, NotSupported, PacketBuf,
     };
+    use embassy_net::{Runner, Stack, StackStorage, StaticPool};
 
     use super::Pool;
 
@@ -205,46 +210,10 @@ pub(crate) mod test {
     /// A network driver that never sends or receives anything.
     ///
     /// Used to construct a `Stack` for the socket tests, which only exercise
-    /// the socket buffers management and never actually communicate.
+    /// socket creation and never actually communicate.
     pub(crate) struct DummyDriver;
 
-    /// A token type that is never constructed, as `DummyDriver` never produces any tokens.
-    pub(crate) enum Never {}
-
-    impl RxToken for Never {
-        fn consume<R, F>(self, _f: F) -> R
-        where
-            F: FnOnce(&mut [u8]) -> R,
-        {
-            match self {}
-        }
-    }
-
-    impl TxToken for Never {
-        fn consume<R, F>(self, _len: usize, _f: F) -> R
-        where
-            F: FnOnce(&mut [u8]) -> R,
-        {
-            match self {}
-        }
-    }
-
     impl Driver for DummyDriver {
-        type RxToken<'a> = Never;
-        type TxToken<'a> = Never;
-
-        fn receive(&mut self, _cx: &mut Context) -> Option<(Never, Never)> {
-            None
-        }
-
-        fn transmit(&mut self, _cx: &mut Context) -> Option<Never> {
-            None
-        }
-
-        fn link_state(&mut self, _cx: &mut Context) -> LinkState {
-            LinkState::Down
-        }
-
         fn capabilities(&self) -> Capabilities {
             let mut caps = Capabilities::default();
             caps.max_transmission_unit = 1514;
@@ -255,22 +224,55 @@ pub(crate) mod test {
         fn hardware_address(&self) -> HardwareAddress {
             HardwareAddress::Ethernet([2, 0, 0, 0, 0, 1])
         }
+
+        fn link_state(&mut self) -> LinkState {
+            LinkState::Down
+        }
+
+        fn register_waker(&mut self, _waker: &core::task::Waker) -> Result<(), NotSupported> {
+            Ok(())
+        }
+
+        fn rx_wanted(&mut self) -> usize {
+            0
+        }
+
+        fn rx_give(&mut self, _buf: PacketBuf) {}
+
+        fn receive(&mut self) -> Option<PacketBuf> {
+            None
+        }
+
+        fn can_transmit(&mut self) -> bool {
+            false
+        }
+
+        fn transmit(&mut self, buf: PacketBuf) -> Result<(), PacketBuf> {
+            Err(buf)
+        }
     }
 
-    /// Create a `Stack` backed by `DummyDriver`, for the socket tests.
-    pub(crate) fn stack<const SOCK: usize>(
-        resources: &mut StackResources<SOCK>,
-    ) -> (Stack<'_>, Runner<'_, DummyDriver>) {
-        embassy_net::new(
-            DummyDriver,
-            Config::ipv4_static(StaticConfigV4 {
-                address: Ipv4Cidr::new(Ipv4Address::new(10, 0, 0, 1), 24),
-                gateway: None,
-                dns_servers: Default::default(),
-            }),
-            resources,
-            0,
-        )
+    /// A stack with one interface, the dummy driver, at 10.0.0.1/24. Leaked:
+    /// the stack wants its storage, pool and driver for its whole life.
+    pub(crate) fn stack() -> (Stack<'static>, Runner<'static>) {
+        extern crate std;
+        use std::boxed::Box;
+
+        let storage = Box::leak(Box::new(StackStorage::new()));
+        let pool: &'static StaticPool<1514, 4> = Box::leak(Box::new(StaticPool::new()));
+        let (stack, runner) = Stack::new(storage, pool, 0);
+        let iface = stack
+            .add_iface_borrowed(Box::leak(Box::new(DummyDriver)))
+            .unwrap();
+        #[cfg(feature = "proto-ipv4")]
+        iface
+            .add_ip_addr(embassy_net::wire::IpCidr::new(
+                core::net::Ipv4Addr::new(10, 0, 0, 1).into(),
+                24,
+            ))
+            .unwrap();
+        let _ = iface;
+        (stack, runner)
     }
 
     #[test]
